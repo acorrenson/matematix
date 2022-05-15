@@ -1,2 +1,3 @@
-(executable
- (name metamath))
+(library
+ (name metamath)
+ (libraries str))
