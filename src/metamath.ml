@@ -40,78 +40,121 @@ let keywords = SymSet.of_list [
 
 let is_keyword s = SymSet.mem s keywords
 
-let parse inp =
-  let rec parse_stmt = function
-    | "${"::toks ->
-      let* (l, toks) = parse_block toks in
-      let* (_, toks) = expect "$}" toks in
-      Some (Block l, toks)
-    | "$c"::toks ->
-      let* (l, toks) = parse_list toks in
-      let* (_, toks) = expect "$." toks in
-      Some (CmdC l, toks)
-    | "$v"::toks ->
-      let* (l, toks) = parse_list toks in
-      let* (_, toks) = expect "$." toks in
-      Some (CmdV l, toks)
-    | "$d"::toks ->
-      let* (l, toks) = parse_list toks in
-      let* (_, toks) = expect "$." toks in
-      Some (CmdD l, toks)
-    | lbl::"$f"::toks when not (is_keyword lbl) ->
-      let* (l, toks) = parse_list toks in
-      let* (_, toks) = expect "$." toks in
-      Some (CmdF (lbl, l), toks)
-    | lbl::"$e"::toks when not (is_keyword lbl) ->
-      let* (l, toks) = parse_list toks in
-      let* (_, toks) = expect "$." toks in
-      Some (CmdE (lbl, l), toks)
-    | lbl::"$a"::toks when not (is_keyword lbl) ->
-      let* (l, toks) = parse_list toks in
-      let* (_, toks) = expect "$." toks in
-      Some (CmdA (lbl, l), toks)
-    | lbl::"$p"::toks when not (is_keyword lbl) ->
-      let* (l, toks) = parse_list toks in
-      let* (_, toks) = expect "$=" toks in
-      let* (p, toks) = parse_list toks in
-      let* (_, toks) = expect "$." toks in
-      Some (CmdP (lbl, l, p), toks)
-    | _ -> None
-  and parse_list = function
-    | [] -> Some ([], [])
-    | x::_  as toks when is_keyword x -> Some ([], toks)
-    | x::toks ->
-      let* (xs, toks) = parse_list toks in
-      Some (x::xs, toks)
-  and parse_block toks =
-    match parse_stmt toks with
-    | None -> Some ([], toks)
-    | Some (x, toks) ->
-      let* (xs, toks) = parse_block toks in
-      Some (x::xs, toks)
-  and expect t = function
-      | tok::toks when tok = t -> Some ((), toks)
-      | _ -> None
+let rec spaces inp =
+  match Stream.peek inp with
+  | Some (' ' | '\t' | '\n') ->
+    Stream.junk inp;
+    spaces inp
+  | _ -> ()
+
+let token inp =
+  let rec next_tok acc =
+    match Stream.peek inp with
+    | None | Some (' ' | '\n' | '\t') -> acc
+    | Some c ->
+      Stream.junk inp;
+      next_tok (acc ^ String.make 1 c)
   in
-  inp
-  |> Str.(split (regexp "[ \t\n]+"))
-  |> parse_block
+  let elem _ =
+    match Stream.peek inp with
+    | None -> None
+    | Some _ -> spaces inp; Some (next_tok "")
+  in
+  Stream.from elem
+
+
+let parse inp =
+  let rec parse_stmt () =
+    match Stream.peek inp with
+    | Some "$(" ->
+      Stream.junk inp;
+      let* _ = parse_comment () in
+      parse_stmt ()
+    | Some "${" ->
+      Stream.junk inp;
+      let* l = parse_block () in
+      let* _ = expect "$}" in
+      Some (Block l)
+    | Some "$c" ->
+      Stream.junk inp;
+      let* l = parse_list () in
+      let* _ = expect "$." in
+      Some (CmdC l)
+    | Some "$v" ->
+      Stream.junk inp;
+      let* l = parse_list () in
+      let* _ = expect "$." in
+      Some (CmdV l)
+    | Some "$d" ->
+      Stream.junk inp;
+      let* l = parse_list () in
+      let* _ = expect "$." in
+      Some (CmdD l)
+    | Some lbl when not (is_keyword lbl) ->
+      Stream.junk inp;
+      begin match Stream.peek inp with
+      | Some "$f" ->
+        Stream.junk inp;
+        let* l = parse_list () in
+        let* _ = expect "$." in
+        Some (CmdF (lbl, l))
+      | Some "$e" ->
+        Stream.junk inp;
+        let* l = parse_list () in
+        let* _ = expect "$." in
+        Some (CmdE (lbl, l))
+      | Some "$a" ->
+        Stream.junk inp;
+        let* l = parse_list () in
+        let* _ = expect "$." in
+        Some (CmdA (lbl, l))
+      | Some "$p" ->
+        Stream.junk inp;
+        let* l = parse_list () in
+        let* _ = expect "$=" in
+        let* p = parse_list () in
+        let* _ = expect "$." in
+        Some (CmdP (lbl, l, p)) 
+      | _ -> None
+      end
+    | _ -> None
+  and parse_list () =
+    match Stream.peek inp with
+    | None -> Some []
+    | Some x when is_keyword x -> Some []
+    | Some x ->
+      Stream.junk inp;
+      let* xs = parse_list () in
+      Some (x::xs)
+  and parse_comment () =
+    match Stream.peek inp with
+    | None -> None
+    | Some "$)" -> Stream.junk inp; Some ()
+    | Some _ ->
+      Stream.junk inp; parse_comment ()
+  and parse_block () =
+    match parse_stmt () with
+    | None -> Some []
+    | Some x ->
+      let* xs = parse_block () in
+      Some (x::xs)
+  and expect t =
+    match Stream.peek inp with
+    | Some tok when tok = t ->
+      Stream.junk inp; Some ()
+    | _ -> None
+  in
+  parse_block ()
 
 let parse_string s =
-  match parse s with
-  | Some (res, []) -> Some res
-  | _ -> None
+  parse (Stream.of_string s |> token)
 
 let parse_file f =
   let inx = open_in f in
-  let s = ref "" in
-  try while true do
-    s := !s ^ "\n" ^ (input_line inx)
-  done; assert false
-  with _ ->
-    Option.map
-      (fun l -> { name = f; content = l })
-      (parse_string !s)
+  Stream.of_channel inx
+  |> token
+  |> parse
+  |> Option.map (fun l -> { name = f; content = l })
 
 type frame = {
   hypothesis : (string * string list) list;
@@ -305,3 +348,5 @@ let load_file f =
   match parse_file f with
   | None -> Printf.eprintf "unable to parse file %s\n" f; exit 1
   | Some prog -> load prog |> print_db
+
+let _ = load_file "set.mm"
