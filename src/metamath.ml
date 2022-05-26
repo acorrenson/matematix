@@ -4,7 +4,7 @@ type stmt =
   (* $v *)
   | CmdV of string list
   (* $f *)
-  | CmdF of string * string list
+  | CmdF of string * string * string
   (* $a *)
   | CmdA of string * string list
   (* $e *)
@@ -97,7 +97,10 @@ let parse inp =
         Stream.junk inp;
         let* l = parse_list () in
         let* _ = expect "$." in
-        Some (CmdF (lbl, l))
+        begin match l with
+        | [ty; x] -> Some (CmdF (lbl, ty, x))
+        | _ -> None
+        end
       | Some "$e" ->
         Stream.junk inp;
         let* l = parse_list () in
@@ -156,16 +159,21 @@ let parse_file f =
   |> parse
   |> Option.map (fun l -> { name = f; content = l })
 
+
+type hypothesis =
+  | Type of string * string
+  | Prop of string * string list
+
 type frame = {
-  hypothesis : (string * string list) list;
-  disjoints  : string list list
+  hypothesis : (string * hypothesis) list;
+  distincts  : string list list
 }
 
-let empty_frame = { hypothesis = []; disjoints = [] }
+let empty_frame = { hypothesis = []; distincts = [] }
 
 let add_disj frames disj =
   match !frames with
-  | f::fs -> frames := { f with disjoints = disj::f.disjoints }::fs
+  | f::fs -> frames := { f with distincts = disj::f.distincts }::fs
   | _ -> assert false
 
 let add_hyp frames hyp =
@@ -196,6 +204,12 @@ let is_var db s = SymSet.mem s db.variables
 
 let is_cst db s = SymSet.mem s db.constants
 
+let print_hyp = function
+  | Type (ty, x) ->
+    Printf.printf "Type %s %s\n" ty x
+  | Prop (ty, body) ->
+    Printf.printf "Prop %s %s\n" ty (String.concat " " body)
+
 let print_db { statements; constants; variables } =
   Printf.printf "Variables : %s\n"
     (SymSet.fold (fun x acc -> acc ^ " " ^ x) variables "");
@@ -207,13 +221,21 @@ let print_db { statements; constants; variables } =
       Printf.printf "Theorem \"%s\": %s\n" name (String.concat " " (typecode::body));
       Printf.printf "Under conditions:\n";
       List.iter (fun (name, cond) ->
-        Printf.printf "\t%s: %s\n" name (String.concat " " cond)
+        match cond with
+        | Type (ty, x) ->
+          Printf.printf "\t%s: %s %s\n" name ty x
+        | Prop (ty, body) ->
+          Printf.printf "\t%s: %s %s\n" name ty (String.concat " " body)
       ) frame.hypothesis
     | Axm { typecode; body; frame; _ } ->
       Printf.printf "Axiom \"%s\": %s\n" name (String.concat " " (typecode::body));
       Printf.printf "Under conditions:\n";
       List.iter (fun (name, cond) ->
-        Printf.printf "\t%s: %s\n" name (String.concat " " cond)
+        match cond with
+        | Type (ty, x) ->
+          Printf.printf "\t%s: %s %s\n" name ty x
+        | Prop (ty, body) ->
+          Printf.printf "\t%s: %s %s\n" name ty (String.concat " " body)
       ) frame.hypothesis
   ) statements
 
@@ -225,25 +247,34 @@ let get_csts vars body =
   List.filter (fun x -> SymSet.mem x vars) body
   |> SymSet.of_list
 
-let non_disj s1 s2 =
+let common_var s1 s2 =
   SymSet.(not (is_empty (inter s1 s2)))
 
-let make_frame { variables; _} frames body =
+let hyp_vars variables = function
+  | Type (_, x) ->
+    if SymSet.mem x variables then
+      SymSet.singleton x
+    else
+      SymSet.empty
+  | Prop (_, body) ->
+    get_vars variables body
+
+let make_frame { variables; _ } frames body =
   match frames with
   | [] -> assert false
-  | { hypothesis; disjoints }::_ ->
+  | { hypothesis; distincts }::_ ->
     let body_vars = get_vars variables body in
     let hypothesis =
       List.filter (fun (_, hyp) ->
-        non_disj body_vars (get_vars variables hyp)
+        common_var body_vars (hyp_vars variables hyp)
       ) hypothesis
     in
-    let disjoints =
+    let distincts =
       List.filter (fun disj ->
-        non_disj body_vars (get_vars variables disj)
-      ) disjoints
+        common_var body_vars (get_vars variables disj)
+      ) distincts
     in
-    { hypothesis; disjoints }
+    { hypothesis; distincts }
 
 
 let check_lbl { statements; _ } lbl =
@@ -264,8 +295,79 @@ let check_body db typecode body =
     end
   end
 
-let check_proof _ _ =
-  failwith "not implemented yet"
+type subst = (string * string list) list
+
+let apply_var (s : subst) (x : string) =
+  match List.assoc_opt x s with
+  | None -> [x]
+  | Some l -> l
+
+let apply (s : subst) =
+  List.concat_map (apply_var s)
+
+let apply' (s : subst) = function
+  | Type (ty, x) -> Prop (ty, apply_var s x)
+  | Prop (ty, body) -> Prop (ty, apply s body)
+
+let compose (x : string) (vx : string list) (s : subst) =
+  (x, vx)::s
+
+let check_proof db _name typecode body frame proof =
+  let classify sym =
+    match List.assoc_opt sym frame.hypothesis with
+    | Some v -> `HYP v | None ->
+    match Hashtbl.find_opt db.statements sym with
+    | Some v -> `THM v | None -> failwith ("unbound label " ^ sym)
+  in
+  let match_hyp hyp arg subst =
+    match hyp, (apply' subst arg) with
+    | Type (ty, x), Type (ty', x') ->
+      if ty = ty' then compose x [x'] subst
+      else failwith (Printf.sprintf "types %s and %s don't match" ty ty')
+    | Type (ty, x), Prop (ty', vx) ->
+      if ty = ty' then compose x vx subst
+      else failwith (Printf.sprintf "types %s and %s don't match" ty ty')
+    | Prop (ty, p), Prop (ty', p') ->
+      if ty = ty' then
+        if p = p' then subst
+        else failwith "body missmatch"
+      else failwith (Printf.sprintf "types %s and %s don't match" ty ty')
+    | _ -> failwith "hypothesis missmatch"
+  in
+  let match_hyps stack hyps =
+    List.fold_left (fun (stack, subst) hyp ->
+      match stack with
+      | arg::stack ->
+        stack, match_hyp hyp arg subst
+      | [] -> failwith "empty stack"
+    ) (stack, []) (List.map snd hyps)
+  in
+  let apply_thm thm stack =
+    match thm with
+    | Axm { typecode; body; frame; _ }
+    | Thm { typecode; body; frame; _ } ->
+      let stack, subst = match_hyps stack frame.hypothesis in
+      let arg = Prop (typecode, apply subst body) in
+      arg::stack
+  in
+  let rec step stack proof =
+    match proof with
+    | [] -> stack
+    | sym::proof ->
+      match classify sym with
+      | `HYP hyp -> step (hyp::stack) proof
+      | `THM thm -> step (apply_thm thm stack) proof
+  in
+  match step [] proof with
+  | [conclusion] ->
+    if conclusion = Prop (typecode, body) then ()
+    else begin
+      print_hyp conclusion;
+      failwith "conclusion of the proof doesnt match the goal"
+    end
+  | [] -> failwith "empty stack after proof"
+  | _ -> failwith "too many arguments in the proof"
+
 
 let make_axm db frames body =
   match body with
@@ -281,19 +383,14 @@ let make_thm db frames body proof =
     Thm { typecode; body; frame = make_frame db frames body; proof }
   | [] -> failwith "Unable to make empty theorem"
 
-let make_type_hyp db frames lbl body =
-  match body with
-  | [ty; v] ->
-    if not (is_cst db ty) then begin
-      Printf.eprintf "in %s : Undefined typecode %s\n" lbl ty;
-      exit 1
-    end else if not (is_var db v) then begin
-      Printf.eprintf "in %S : Undefined variable %s\n" lbl v;
-      exit 1
-    end else add_hyp frames (lbl, body)
-  | _ ->
-    Printf.eprintf "in %s : ill-formed typing hypothesis\n" lbl;
+let make_type_hyp db frames lbl ty v =
+  if not (is_cst db ty) then begin
+    Printf.eprintf "in %s : Undefined typecode %s\n" lbl ty;
     exit 1
+  end else if not (is_var db v) then begin
+    Printf.eprintf "in %S : Undefined variable %s\n" lbl v;
+    exit 1
+  end else add_hyp frames (lbl, Type (ty, v))
 
 let make_hyp db frames lbl body =
   match body with
@@ -302,7 +399,7 @@ let make_hyp db frames lbl body =
       Printf.eprintf "in %s : Undefined typecode %s\n" lbl ty;
       exit 1
     end else begin
-      add_hyp frames (lbl, body)
+      add_hyp frames (lbl, Prop (ty, body))
     end
   | _ ->
     Printf.eprintf "in %s : ill-formed hypothesis\n" lbl;
@@ -329,8 +426,8 @@ let load { content; _ } : db =
         db.constants <- SymSet.union db.constants (SymSet.of_list csts)
       | CmdV vars ->
         db.variables <- SymSet.union db.variables (SymSet.of_list vars)
-      | CmdF (lbl, body) ->
-        make_type_hyp db frames lbl body
+      | CmdF (lbl, ty, x) ->
+        make_type_hyp db frames lbl ty x
       | CmdE (lbl, body) ->
         make_hyp db frames lbl body
       | CmdD disj ->
@@ -347,6 +444,14 @@ let load { content; _ } : db =
 let load_file f =
   match parse_file f with
   | None -> Printf.eprintf "unable to parse file %s\n" f; exit 1
-  | Some prog -> load prog |> print_db
+  | Some prog -> let db = load prog in print_db db; db
 
-let _ = load_file "set.mm"
+let check_sym db sym =
+  match Hashtbl.find_opt db.statements sym with
+  | Some (Thm { typecode; body; frame; proof }) ->
+    check_proof db sym typecode body frame proof
+  | _ -> failwith "nothing to prove"
+
+let () = check_sym (load_file "test.mm") "wnew"
+
+(* let db = load_file "test.mm" *)
